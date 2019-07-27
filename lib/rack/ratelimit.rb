@@ -68,20 +68,9 @@ module Rack
       @max, @period = options.fetch(:rate)
       @status = options.fetch(:status, 429)
       @ban_duration = options[:ban_duration]
-
-      @counter =
-          if counter = options[:counter]
-            raise ArgumentError, 'Counter must respond to #increment' unless counter.respond_to?(:increment)
-            counter
-          elsif cache = options[:cache]
-            MemcachedCounter.new(cache, @name, @period)
-          elsif redis = options[:redis]
-            RedisCounter.new(redis, @name, @period)
-          else
-            raise ArgumentError, ':cache, :redis, or :counter is required'
-          end
-
       @logger = options[:logger]
+
+      @store = build_store(options)
       @error_message = options.fetch(:error_message, "#{@name} rate limit exceeded. Please wait %d seconds then retry your request.")
 
       @conditions = Array(options[:conditions])
@@ -128,7 +117,7 @@ module Rack
       # upstream timing and for testing.
       now = env.fetch('ratelimit.timestamp', Time.now).to_f
 
-      if @ban_duration && (classification = classify(env)) && @counter.banned?(classification)
+      if @ban_duration && (classification = classify(env)) && @store.banned?(classification)
         build_banned_request_response(now)
       elsif apply_rate_limit?(env) && (classification ||= classify(env))
         handle_rate_limited_request(env, now, classification)
@@ -138,6 +127,29 @@ module Rack
     end
 
     private
+
+      def build_store(options)
+        if options[:counter]
+          @logger.info ':counter option has been deprecated. Please, use :store instead.' if @logger
+          options[:store] = options[:counter]
+        end
+
+        if store = options[:store]
+          raise ArgumentError, 'Store must respond to #increment, and also to #ban and #banned? if :ban_duration option is used' unless valid_store?(store)
+          store
+        elsif cache = options[:cache]
+          MemcachedStore.new(cache, @name, @period)
+        elsif redis = options[:redis]
+          RedisStore.new(redis, @name, @period)
+        else
+          raise ArgumentError, ':cache, :redis, or :store is required'
+        end
+      end
+
+      def valid_store?(store)
+        store.respond_to?(:increment) && (!@ban_duration || %i[ban! banned?].all? {|method| store.respond_to?(method)})
+      end
+
       def build_banned_request_response(now)
         [@status,
          {'X-Ratelimit' => banned_json(now + @ban_duration),
@@ -148,7 +160,7 @@ module Rack
       def handle_rate_limited_request(env, now, classification)
         # Increment the request counter.
         epoch = ratelimit_epoch(now)
-        count = @counter.increment(classification, epoch)
+        count = @store.increment(classification, epoch)
         remaining = @max - count
 
         # If exceeded, return a 429 Rate Limit Exceeded response.
@@ -171,7 +183,7 @@ module Rack
 
       def build_limit_exceeded_response(classification, now, epoch, remaining)
         if @ban_duration
-          @counter.ban!(classification, @ban_duration)
+          @store.ban!(classification, @ban_duration)
           retry_after = @ban_duration
           retry_epoch = now + @ban_duration
         else
@@ -219,18 +231,18 @@ module Rack
         headers[name] = [headers[name], value].compact.join("\n")
       end
 
-      module CounterKeys
-        def rate_key(classification, epoch)
-          'rack-ratelimit/%s/%s/%i' % [@name, classification, epoch]
+      module StoreKeys
+        def rate_key(name, classification, epoch)
+          'rack-ratelimit/%s/%s/%i' % [name, classification, epoch]
         end
 
-        def ban_key(classification)
-          'rack-ratelimit/banned/%s/%s' % [@name, classification]
+        def ban_key(name, classification)
+          'rack-ratelimit/banned/%s/%s' % [name, classification]
         end
       end
 
-      class MemcachedCounter
-        include CounterKeys
+      class MemcachedStore
+        include StoreKeys
 
         def initialize(cache, name, period)
           @cache, @name, @period = cache, name, period
@@ -238,14 +250,14 @@ module Rack
 
         # Increment the request counter and return the current count.
         def increment(classification, epoch)
-          key = rate_key(classification, epoch)
+          key = rate_key(@name, classification, epoch)
 
           # Try to increment the counter if it's present.
           if count = @cache.incr(key, 1)
             count.to_i
 
             # If not, add the counter and set expiry.
-          elsif @cache.add(key, 1, @period, :raw => true)
+          elsif @cache.add(key, 1, @period, raw: true)
             1
 
             # If adding failed, someone else added it concurrently. Increment.
@@ -255,17 +267,17 @@ module Rack
         end
 
         def ban!(classification, ban_duration)
-          key = ban_key(classification)
-          @cache.add(key, 1, ban_duration, :raw => true)
+          key = ban_key(@name, classification)
+          @cache.add(key, 1, ban_duration, raw: true)
         end
 
         def banned?(classification)
-          @cache.get(ban_key(classification))
+          @cache.get(ban_key(@name, classification))
         end
       end
 
-      class RedisCounter
-        include CounterKeys
+      class RedisStore
+        include StoreKeys
 
         def initialize(redis, name, period)
           @redis, @name, @period = redis, name, period
@@ -273,7 +285,7 @@ module Rack
 
         # Increment the request counter and return the current count.
         def increment(classification, epoch)
-          key = rate_key(classification, epoch)
+          key = rate_key(@name, classification, epoch)
           # Returns [count, expire_ok] response for each multi command.
           # Return the first, the count.
           @redis.multi do |redis|
@@ -283,12 +295,12 @@ module Rack
         end
 
         def ban!(classification, ban_duration)
-          key = ban_key(classification)
+          key = ban_key(@name, classification)
           @redis.setex(key, ban_duration, 1)
         end
 
         def banned?(classification)
-          @redis.get(ban_key(classification))
+          @redis.get(ban_key(@name, classification))
         end
       end
   end

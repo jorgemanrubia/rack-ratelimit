@@ -214,22 +214,43 @@ class RedisRatelimitTest < Minitest::Test
     end
 end
 
-class CustomCounterRatelimitTest < Minitest::Test
+class CustomStoreRatelimitTest < Minitest::Test
   include RatelimitTests
+
+  def test_raises_error_when_missing_increment_method
+    assert_raises ArgumentError do
+      Rack::Ratelimit.new(nil, rate: [1,10], store: store_without_methods(:increment))
+    end
+  end
+
+  def test_raises_error_when_ban_duration_is_used_but_ban_methods_are_missing
+    assert_raises ArgumentError do
+      Rack::Ratelimit.new(nil, rate: [1,10], ban_duration: 15, store: store_without_methods(:ban!))
+      Rack::Ratelimit.new(nil, rate: [1,10], ban_duration: 15, store: store_without_methods(:banned?))
+    end
+  end
 
   private
     def ratelimit_options
-      super.merge counter: Counter.new
+      super.merge store: Store.new
     end
 
-  class Counter
+    def store_without_methods(*methods_to_remove)
+      Store.new.tap do |valid_store|
+        methods_to_remove.each do |method|
+          valid_store.instance_eval("undef :#{method}")
+        end
+      end
+    end
+
+  class Store
     def initialize
       @counters = Hash.new do |classifications, name|
         classifications[name] = Hash.new do |timeslices, timestamp|
           timeslices[timestamp] = 0
         end
       end
-      @banned_clients = Set.new
+      @banned_clients = {}
     end
 
     def increment(classification, timestamp)
@@ -237,11 +258,11 @@ class CustomCounterRatelimitTest < Minitest::Test
     end
 
     def ban!(classification, ban_duration)
-      @banned_clients << classification
+      @banned_clients[classification] = ban_duration
     end
 
     def banned?(classification)
-      @banned_clients.include?(classification)
+      @banned_clients[classification]
     end
   end
 end
