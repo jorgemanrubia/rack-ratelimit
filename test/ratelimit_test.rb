@@ -10,12 +10,15 @@ require 'dalli'
 require 'redis'
 
 module RatelimitTests
+  BAN_DURATION = 15
+
   def setup
     @app = ->(env) { [200, {}, []] }
     @logger = Logger.new(@out = StringIO.new)
 
     @limited = build_ratelimiter(@app, name: :one, rate: [1, 10])
     @two_limits = build_ratelimiter(@limited, name: :two, rate: [1, 10])
+    @banneable = build_ratelimiter(@app, name: :banned, rate: [1, 10], ban_duration: BAN_DURATION)
   end
 
   def test_name_defaults_to_HTTP
@@ -61,6 +64,33 @@ module RatelimitTests
     assert_match %r({"name":"one","period":10,"limit":1,"remaining":0,"until":".*"}), headers['X-Ratelimit']
     assert_equal "one rate limit exceeded. Please wait #{retry_after} seconds then retry your request.", body.first
     assert_match %r{one: classification exceeded 1 request limit for}, @out.string
+  end
+
+  def test_responds_with_429_indicating_ban_duration_the_first_time_a_request_is_banned
+    timestamp = Time.now.to_f
+    retry_after = BAN_DURATION
+
+    assert_equal 200, @banneable.call('limit-by' => 'key', 'ratelimit.timestamp' => timestamp).first
+    status, headers, body = @banneable.call('limit-by' => 'key', 'ratelimit.timestamp' => timestamp)
+    assert_equal 429, status
+    assert_equal retry_after.to_s, headers['Retry-After']
+    assert_match '0', headers['X-Ratelimit']
+    assert_match %r({"name":"banned","period":10,"limit":1,"remaining":0,"until":".*"}), headers['X-Ratelimit']
+    assert_equal "banned rate limit exceeded. Please wait #{retry_after} seconds then retry your request.", body.first
+    assert_match %r{banned: classification exceeded 1 request limit for}, @out.string
+  end
+
+  def test_responds_with_429_to_every_request_from_banned_clients
+    @banneable.condition { |env| env['target'] } # to test that banning works when conditions don't match too
+
+    timestamp = Time.now.to_f
+    retry_after = BAN_DURATION
+
+    assert_equal 200, @banneable.call('target' => true, 'ratelimit.timestamp' => timestamp).first
+    @banneable.call('target' => true, 'ratelimit.timestamp' => timestamp)
+    status, headers, _ = @banneable.call('ratelimit.timestamp' => timestamp)
+    assert_equal 429, status
+    assert_equal retry_after.to_s, headers['Retry-After']
   end
 
   def test_optional_response_status
@@ -199,10 +229,19 @@ class CustomCounterRatelimitTest < Minitest::Test
           timeslices[timestamp] = 0
         end
       end
+      @banned_clients = Set.new
     end
 
     def increment(classification, timestamp)
       @counters[classification][timestamp] += 1
+    end
+
+    def ban!(classification, ban_duration)
+      @banned_clients << classification
+    end
+
+    def banned?(classification)
+      @banned_clients.include?(classification)
     end
   end
 end

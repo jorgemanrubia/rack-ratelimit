@@ -67,18 +67,19 @@ module Rack
       @name = options.fetch(:name, 'HTTP')
       @max, @period = options.fetch(:rate)
       @status = options.fetch(:status, 429)
+      @ban_duration = options[:ban_duration]
 
       @counter =
-        if counter = options[:counter]
-          raise ArgumentError, 'Counter must respond to #increment' unless counter.respond_to?(:increment)
-          counter
-        elsif cache = options[:cache]
-          MemcachedCounter.new(cache, @name, @period)
-        elsif redis = options[:redis]
-          RedisCounter.new(redis, @name, @period)
-        else
-          raise ArgumentError, ':cache, :redis, or :counter is required'
-        end
+          if counter = options[:counter]
+            raise ArgumentError, 'Counter must respond to #increment' unless counter.respond_to?(:increment)
+            counter
+          elsif cache = options[:cache]
+            MemcachedCounter.new(cache, @name, @period)
+          elsif redis = options[:redis]
+            RedisCounter.new(redis, @name, @period)
+          else
+            raise ArgumentError, ':cache, :redis, or :counter is required'
+          end
 
       @logger = options[:logger]
       @error_message = options.fetch(:error_message, "#{@name} rate limit exceeded. Please wait %d seconds then retry your request.")
@@ -127,7 +128,24 @@ module Rack
       # upstream timing and for testing.
       now = env.fetch('ratelimit.timestamp', Time.now).to_f
 
-      if apply_rate_limit?(env) && classification = classify(env)
+      if @ban_duration && (classification = classify(env)) && @counter.banned?(classification)
+        build_banned_request_response(now)
+      elsif apply_rate_limit?(env) && (classification ||= classify(env))
+        handle_rate_limited_request(env, now, classification)
+      else
+        @app.call(env)
+      end
+    end
+
+    private
+      def build_banned_request_response(now)
+        [@status,
+         {'X-Ratelimit' => banned_json(now + @ban_duration),
+          'Retry-After' => @ban_duration.to_s},
+         [@error_message % @ban_duration]]
+      end
+
+      def handle_rate_limited_request(env, now, classification)
         # Increment the request counter.
         epoch = ratelimit_epoch(now)
         count = @counter.increment(classification, epoch)
@@ -135,30 +153,44 @@ module Rack
 
         # If exceeded, return a 429 Rate Limit Exceeded response.
         if remaining < 0
-          # Only log the first hit that exceeds the limit.
-          if @logger && remaining == -1
-            @logger.info '%s: %s exceeded %d request limit for %s' % [@name, classification, @max, format_epoch(epoch)]
-          end
-
-          retry_after = seconds_until_epoch(epoch)
-
-          [ @status,
-            { 'X-Ratelimit' => ratelimit_json(remaining, epoch),
-              'Retry-After' => retry_after.to_s },
-            [ @error_message % retry_after ] ]
-
+          handle_limit_exceeded_request(classification, now, epoch, remaining)
         # Otherwise, pass through then add some informational headers.
         else
-          @app.call(env).tap do |status, headers, body|
-            amend_headers headers, 'X-Ratelimit', ratelimit_json(remaining, epoch)
-          end
+          handle_request_between_limits(env, epoch, remaining)
         end
-      else
-        @app.call(env)
       end
-    end
 
-    private
+      def handle_limit_exceeded_request(classification, now, epoch, remaining)
+        # Only log the first hit that exceeds the limit.
+        if @logger && remaining == -1
+          @logger.info '%s: %s exceeded %d request limit for %s' % [@name, classification, @max, format_epoch(epoch)]
+        end
+
+        build_limit_exceeded_response(classification, now, epoch, remaining)
+      end
+
+      def build_limit_exceeded_response(classification, now, epoch, remaining)
+        if @ban_duration
+          @counter.ban!(classification, @ban_duration)
+          retry_after = @ban_duration
+          retry_epoch = now + @ban_duration
+        else
+          retry_after = seconds_until_epoch(epoch)
+          retry_epoch = epoch
+        end
+
+        [@status,
+         {'X-Ratelimit' => ratelimit_json(remaining, retry_epoch),
+          'Retry-After' => retry_after.to_s},
+         [@error_message % retry_after]]
+      end
+
+      def handle_request_between_limits(env, epoch, remaining)
+        @app.call(env).tap do |status, headers, body|
+          amend_headers headers, 'X-Ratelimit', ratelimit_json(remaining, epoch)
+        end
+      end
+
       # Calculate the end of the current rate-limiting window.
       def ratelimit_epoch(timestamp)
         @period * (timestamp / @period).ceil
@@ -168,11 +200,15 @@ module Rack
         %({"name":"#{@name}","period":#{@period},"limit":#{@max},"remaining":#{remaining < 0 ? 0 : remaining},"until":"#{format_epoch(epoch)}"})
       end
 
+      def banned_json(epoch)
+        %({"name":"#{@name}","period":#{@period},"limit":#{@max},"until":"#{format_epoch(epoch)}"})
+      end
+
       def format_epoch(epoch)
         Time.at(epoch).utc.xmlschema
       end
 
-      # Clamp negative durations in case we're in a new rate-limiting window.
+    # Clamp negative durations in case we're in a new rate-limiting window.
       def seconds_until_epoch(epoch)
         sec = (epoch - Time.now.to_f).ceil
         sec = 0 if sec < 0
@@ -183,46 +219,77 @@ module Rack
         headers[name] = [headers[name], value].compact.join("\n")
       end
 
-    class MemcachedCounter
-      def initialize(cache, name, period)
-        @cache, @name, @period = cache, name, period
-      end
+      module CounterKeys
+        def rate_key(classification, epoch)
+          'rack-ratelimit/%s/%s/%i' % [@name, classification, epoch]
+        end
 
-      # Increment the request counter and return the current count.
-      def increment(classification, epoch)
-        key = 'rack-ratelimit/%s/%s/%i' % [@name, classification, epoch]
-
-        # Try to increment the counter if it's present.
-        if count = @cache.incr(key, 1)
-          count.to_i
-
-        # If not, add the counter and set expiry.
-        elsif @cache.add(key, 1, @period, :raw => true)
-          1
-
-        # If adding failed, someone else added it concurrently. Increment.
-        else
-          @cache.incr(key, 1).to_i
+        def ban_key(classification)
+          'rack-ratelimit/banned/%s/%s' % [@name, classification]
         end
       end
-    end
 
-    class RedisCounter
-      def initialize(redis, name, period)
-        @redis, @name, @period = redis, name, period
+      class MemcachedCounter
+        include CounterKeys
+
+        def initialize(cache, name, period)
+          @cache, @name, @period = cache, name, period
+        end
+
+        # Increment the request counter and return the current count.
+        def increment(classification, epoch)
+          key = rate_key(classification, epoch)
+
+          # Try to increment the counter if it's present.
+          if count = @cache.incr(key, 1)
+            count.to_i
+
+            # If not, add the counter and set expiry.
+          elsif @cache.add(key, 1, @period, :raw => true)
+            1
+
+            # If adding failed, someone else added it concurrently. Increment.
+          else
+            @cache.incr(key, 1).to_i
+          end
+        end
+
+        def ban!(classification, ban_duration)
+          key = ban_key(classification)
+          @cache.add(key, 1, ban_duration, :raw => true)
+        end
+
+        def banned?(classification)
+          @cache.get(ban_key(classification))
+        end
       end
 
-      # Increment the request counter and return the current count.
-      def increment(classification, epoch)
-        key = 'rack-ratelimit/%s/%s/%i' % [@name, classification, epoch]
+      class RedisCounter
+        include CounterKeys
 
-        # Returns [count, expire_ok] response for each multi command.
-        # Return the first, the count.
-        @redis.multi do |redis|
-          redis.incr key
-          redis.expire key, @period
-        end.first
+        def initialize(redis, name, period)
+          @redis, @name, @period = redis, name, period
+        end
+
+        # Increment the request counter and return the current count.
+        def increment(classification, epoch)
+          key = rate_key(classification, epoch)
+          # Returns [count, expire_ok] response for each multi command.
+          # Return the first, the count.
+          @redis.multi do |redis|
+            redis.incr key
+            redis.expire key, @period
+          end.first
+        end
+
+        def ban!(classification, ban_duration)
+          key = ban_key(classification)
+          @redis.setex(key, ban_duration, 1)
+        end
+
+        def banned?(classification)
+          @redis.get(ban_key(classification))
+        end
       end
-    end
   end
 end
