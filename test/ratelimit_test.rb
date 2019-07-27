@@ -1,13 +1,4 @@
-require 'rubygems'
-require 'bundler/setup'
-require 'minitest/autorun'
-
-require 'rack/ratelimit'
-require 'stringio'
-require 'json'
-
-require 'dalli'
-require 'redis'
+require_relative './test_helper'
 
 module RatelimitTests
   WINDOW_DURATION = 10
