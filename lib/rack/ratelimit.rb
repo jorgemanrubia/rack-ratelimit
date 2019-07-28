@@ -178,12 +178,13 @@ module Rack
           @logger.info '%s: %s exceeded %d request limit for %s' % [@name, classification, @max, format_epoch(epoch)]
         end
 
-        build_limit_exceeded_response(classification, now, epoch, remaining)
+        @store.ban!(classification, @ban_duration) if @ban_duration
+
+        build_limit_exceeded_response(now, epoch, remaining)
       end
 
-      def build_limit_exceeded_response(classification, now, epoch, remaining)
+      def build_limit_exceeded_response(now, epoch, remaining)
         if @ban_duration
-          @store.ban!(classification, @ban_duration)
           retry_after = @ban_duration
           retry_epoch = now + @ban_duration
         else
@@ -192,7 +193,7 @@ module Rack
         end
 
         [@status,
-         {'X-Ratelimit' => ratelimit_json(remaining, retry_epoch),
+         {'X-Ratelimit' => ratelimit_json(remaining, retry_epoch, true),
           'Retry-After' => retry_after.to_s},
          [@error_message % retry_after]]
       end
@@ -208,12 +209,12 @@ module Rack
         @period * (timestamp / @period).ceil
       end
 
-      def ratelimit_json(remaining, epoch)
-        %({"name":"#{@name}","period":#{@period},"limit":#{@max},"remaining":#{remaining < 0 ? 0 : remaining},"until":"#{format_epoch(epoch)}"})
+      def ratelimit_json(remaining, epoch, global = false)
+        %({"name":"#{@name}","period":#{@period},"limit":#{@max},"remaining":#{remaining < 0 ? 0 : remaining},"until":"#{format_epoch(epoch)}","global":"#{global}"})
       end
 
       def banned_json(epoch)
-        %({"name":"#{@name}","period":#{@period},"limit":#{@max},"until":"#{format_epoch(epoch)}"})
+        ratelimit_json(0, epoch, true)
       end
 
       def format_epoch(epoch)

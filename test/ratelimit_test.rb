@@ -38,8 +38,8 @@ module RatelimitTests
     assert_equal 200, status
     info = headers['X-Ratelimit'].split("\n")
     assert_equal 2, info.size
-    assert_match %r({"name":"one","period":10,"limit":1,"remaining":0,"until":".*"}), info.first
-    assert_match %r({"name":"two","period":10,"limit":1,"remaining":0,"until":".*"}), info.last
+    assert_match %r({"name":"one","period":10,"limit":1,"remaining":0,"until":".*","global":"false"}), info.first
+    assert_match %r({"name":"two","period":10,"limit":1,"remaining":0,"until":".*","global":"false"}), info.last
     assert_equal [], body
     refute_match '/exceeded/', @out.string
   end
@@ -69,7 +69,7 @@ module RatelimitTests
     assert_equal BAN_DURATION, ban_ttl('banned', 'classification')
     assert_equal retry_after.to_s, headers['Retry-After']
     assert_match '0', headers['X-Ratelimit']
-    assert_match %r({"name":"banned","period":10,"limit":1,"remaining":0,"until":".*"}), headers['X-Ratelimit']
+    assert_match %r({"name":"banned","period":10,"limit":1,"remaining":0,"until":".*","global":"true"}), headers['X-Ratelimit']
     assert_equal "banned rate limit exceeded. Please wait #{retry_after} seconds then retry your request.", body.first
     assert_match %r{banned: classification exceeded 1 request limit for}, @out.string
   end
@@ -83,6 +83,7 @@ module RatelimitTests
     assert_equal 200, @banneable.call('target' => true, 'ratelimit.timestamp' => timestamp).first
     @banneable.call('target' => true, 'ratelimit.timestamp' => timestamp)
     status, headers, _ = @banneable.call('ratelimit.timestamp' => timestamp)
+    assert_match %r({"name":"banned","period":10,"limit":1,"remaining":0,"until":".*","global":"true"}), headers['X-Ratelimit']
     assert_equal 429, status
     assert_equal retry_after.to_s, headers['Retry-After']
   end
