@@ -7,6 +7,7 @@ module Rack
   # * Run multiple rate limiters in a single app
   # * Scope each rate limit to certain requests: API, files, GET vs POST, etc.
   # * Apply each rate limit by request characteristics: IP, subdomain, OAuth2 token, etc.
+  # * Option to ban misbehaving clients for a given period of time
   # * Flexible time window to limit burst traffic vs hourly or daily traffic:
   #     100 requests per 10 sec, 500 req/minute, 10000 req/hour, etc.
   # * Fast, low-overhead implementation using counters per time window:
@@ -19,30 +20,46 @@ module Rack
     # not given, all requests get the same limits.
     #
     # Required configuration:
-    #   rate: an array of [max requests, period in seconds]: [500, 5.minutes]
+    #
+    # * <tt>:rate</tt> - an array of [max requests, period in seconds]: [500, 5.minutes]
+    #
     # and one of
-    #   cache: a Dalli::Client instance
-    #   redis: a Redis instance
-    #   counter: Your own custom counter. Must respond to
-    #     `#increment(classification_string, end_of_time_window_epoch_timestamp)`
-    #     and return the counter value after increment.
+    #
+    # * <tt>:cache</tt> - a Dalli::Client instance
+    # * <tt>:redis</tt> - a Redis instance
+    # * <tt>:store</tt> - Your own custom store. A store is responsible of increasing counters
+    #   and implementing banning logic. Must respond to these methods:
+    #
+    #     # Returns the counter value after increment
+    #     def increment(classification_string, end_of_time_window_epoch_timestamp)
+    #     end
+    #
+    #     # Bans the given classification string for the provided duration in seconds
+    #     def ban!(classification, ban_duration)
+    #     end
+    #
+    #     # Returns whether the given classification string is banned
+    #     def banned?(classification)
+    #     end
     #
     # Optional configuration:
-    #   name: name of the rate limiter. Defaults to 'HTTP'. Used in messages.
-    #   status: HTTP response code. Defaults to 429.
-    #   conditions: array of procs that take a rack env, all of which must
-    #     return true to rate-limit the request.
-    #   exceptions: array of procs that take a rack env, any of which may
-    #     return true to exclude the request from rate limiting.
-    #   logger: responds to #info(message). If provided, the rate limiter
-    #     logs the first request that hits the rate limit, but none of the
-    #     subsequently blocked requests.
-    #   error_message: the message returned in the response body when the rate
-    #     limit is exceeded. Defaults to "<name> rate limit exceeded. Please
-    #     wait %d seconds then retry your request." The number of seconds
-    #     until the end of the rate-limiting window is interpolated into the
-    #     message string, but the %d placeholder is optional if you wish to
-    #     omit it.
+    #
+    # * <tt>:name</tt> - name of the rate limiter. Defaults to 'HTTP'. Used in messages.
+    # * <tt>:ban_duration</tt> - period of time in seconds during which clients who exceed the
+    #   rate will be banned (all their requests will be rejected). Defaults to +nil+ (no banning).
+    # * <tt>:status</tt> - HTTP response code. Defaults to 429.
+    # * <tt>:conditions</tt> - array of procs that take a rack env, all of which must
+    #   return true to rate-limit the request.
+    # * <tt>:exceptions</tt> - array of procs that take a rack env, any of which may
+    #   return true to exclude the request from rate limiting.
+    # * <tt>:logger</tt> - responds to #info(message). If provided, the rate limiter
+    #   logs the first request that hits the rate limit, but none of the
+    #   subsequently blocked requests.
+    # * <tt>:error_message</tt> - the message returned in the response body when the rate
+    #   limit is exceeded. Defaults to "<name> rate limit exceeded. Please wait %d seconds
+    #   then retry your request." The number of seconds until the end of the rate-limiting
+    #   window is interpolated into the message string, but the %d placeholder is optional
+    #   if you wish to omit it.
     #
     # Example:
     #
@@ -60,6 +77,15 @@ module Rack
     #     rate:   [1000, 1.hour],
     #     redis:  Redis.new(ratelimit_redis_config),
     #     logger: Rails.logger) { |env| env['REMOTE_USER'] }
+    #
+    # Ban IPs that make more than 10 POST requests to `/sessions` in 5 minutes, with the ban lasting 24 hours:
+    #
+    #   use(Rack::Ratelimit, name: 'login_brute_force',
+    #       conditions: ->(env) {env['REQUEST_METHOD'] == 'POST' && env['PATH_INFO'] =~ /\A\/sessions/},
+    #       rate: [10, 5.minutes],
+    #       ban_duration: 24.hours,
+    #       cache: Dalli::Client.new,
+    #       logger: Rails.logger) {|env| Rack::Request.new(env).ip}
     def initialize(app, options, &classifier)
       @app, @classifier = app, classifier
       @classifier ||= lambda { |env| :request }
@@ -105,11 +131,14 @@ module Rack
     end
 
     # Handle a Rack request:
+    #   * When :ban_duration is set, check if the client is banned, returning a 429
+    #   response if it is
     #   * Check whether the rate limit applies to the request.
     #   * Classify the request by IP, API token, etc.
     #   * Calculate the end of the current time window.
     #   * Increment the counter for this classification and time window.
-    #   * If count exceeds limit, return a 429 response.
+    #   * If count exceeds limit, return a 429 response and, when :ban_duration is set, ban
+    #   the client by storing its classification key
     #   * If it's the first request that exceeds the limit, log it.
     #   * If the count doesn't exceed the limit, pass through the request.
     def call(env)
@@ -120,7 +149,7 @@ module Rack
       if @ban_duration && (classification = classify(env)) && @store.banned?(classification)
         build_banned_request_response(now)
       elsif apply_rate_limit?(env) && (classification ||= classify(env))
-        handle_rate_limited_request(env, now, classification)
+        respond_to_rate_limited_request(env, now, classification)
       else
         @app.call(env)
       end
@@ -157,22 +186,20 @@ module Rack
          [@error_message % @ban_duration]]
       end
 
-      def handle_rate_limited_request(env, now, classification)
+      def respond_to_rate_limited_request(env, now, classification)
         # Increment the request counter.
         epoch = ratelimit_epoch(now)
         count = @store.increment(classification, epoch)
         remaining = @max - count
 
-        # If exceeded, return a 429 Rate Limit Exceeded response.
         if remaining < 0
-          handle_limit_exceeded_request(classification, now, epoch, remaining)
-        # Otherwise, pass through then add some informational headers.
+          respond_with_limit_exceeded(classification, now, epoch, remaining)
         else
-          handle_request_between_limits(env, epoch, remaining)
+          respond_by_passing_through_with_headers_info(env, epoch, remaining)
         end
       end
 
-      def handle_limit_exceeded_request(classification, now, epoch, remaining)
+      def respond_with_limit_exceeded(classification, now, epoch, remaining)
         @store.ban!(classification, @ban_duration) if @ban_duration
 
         # Only log the first hit that exceeds the limit.
@@ -199,7 +226,7 @@ module Rack
          [@error_message % retry_after]]
       end
 
-      def handle_request_between_limits(env, epoch, remaining)
+      def respond_by_passing_through_with_headers_info(env, epoch, remaining)
         @app.call(env).tap do |status, headers, body|
           amend_headers headers, 'X-Ratelimit', ratelimit_json(remaining, epoch)
         end
@@ -233,77 +260,84 @@ module Rack
         headers[name] = [headers[name], value].compact.join("\n")
       end
 
-      module StoreKeys
-        def rate_key(name, classification, epoch)
-          'rack-ratelimit/%s/%s/%i' % [name, classification, epoch]
-        end
+    # Methods to generate keys used across built-in stores (Redis, Memcached)
+    module StoreKeys
+      # Generate a key for storing a rate-limit counter
+      def rate_key(name, classification, epoch)
+        'rack-ratelimit/%s/%s/%i' % [name, classification, epoch]
+      end
 
-        def ban_key(name, classification)
-          'rack-ratelimit/banned/%s/%s' % [name, classification]
+      # Generate a key for banning clients
+      def ban_key(name, classification)
+        'rack-ratelimit/banned/%s/%s' % [name, classification]
+      end
+    end
+
+    class MemcachedStore
+      include StoreKeys
+
+      def initialize(cache, name, period)
+        @cache, @name, @period = cache, name, period
+      end
+
+      # Increment the request counter and return the current count.
+      def increment(classification, epoch)
+        key = rate_key(@name, classification, epoch)
+
+        # Try to increment the counter if it's present.
+        if count = @cache.incr(key, 1)
+          count.to_i
+
+        # If not, add the counter and set expiry.
+        elsif @cache.add(key, 1, @period, raw: true)
+          1
+
+          # If adding failed, someone else added it concurrently. Increment.
+        else
+          @cache.incr(key, 1).to_i
         end
       end
 
-      class MemcachedStore
-        include StoreKeys
-
-        def initialize(cache, name, period)
-          @cache, @name, @period = cache, name, period
-        end
-
-        # Increment the request counter and return the current count.
-        def increment(classification, epoch)
-          key = rate_key(@name, classification, epoch)
-
-          # Try to increment the counter if it's present.
-          if count = @cache.incr(key, 1)
-            count.to_i
-
-          # If not, add the counter and set expiry.
-          elsif @cache.add(key, 1, @period, raw: true)
-            1
-
-            # If adding failed, someone else added it concurrently. Increment.
-          else
-            @cache.incr(key, 1).to_i
-          end
-        end
-
-        def ban!(classification, ban_duration)
-          key = ban_key(@name, classification)
-          @cache.add(key, 1, ban_duration, raw: true)
-        end
-
-        def banned?(classification)
-          @cache.get(ban_key(@name, classification))
-        end
+      # Ban the given classification string for the provided duration in seconds
+      def ban!(classification, ban_duration)
+        key = ban_key(@name, classification)
+        @cache.add(key, 1, ban_duration, raw: true)
       end
 
-      class RedisStore
-        include StoreKeys
-
-        def initialize(redis, name, period)
-          @redis, @name, @period = redis, name, period
-        end
-
-        # Increment the request counter and return the current count.
-        def increment(classification, epoch)
-          key = rate_key(@name, classification, epoch)
-          # Returns [count, expire_ok] response for each multi command.
-          # Return the first, the count.
-          @redis.multi do |redis|
-            redis.incr key
-            redis.expire key, @period
-          end.first
-        end
-
-        def ban!(classification, ban_duration)
-          key = ban_key(@name, classification)
-          @redis.setex(key, ban_duration, 1)
-        end
-
-        def banned?(classification)
-          @redis.get(ban_key(@name, classification))
-        end
+      # return whether the given classification string is banned
+      def banned?(classification)
+        @cache.get(ban_key(@name, classification))
       end
+    end
+
+    class RedisStore
+      include StoreKeys
+
+      def initialize(redis, name, period)
+        @redis, @name, @period = redis, name, period
+      end
+
+      # Increment the request counter and return the current count.
+      def increment(classification, epoch)
+        key = rate_key(@name, classification, epoch)
+        # Returns [count, expire_ok] response for each multi command.
+        # Return the first, the count.
+        @redis.multi do |redis|
+          redis.incr key
+          redis.expire key, @period
+        end.first
+      end
+
+      # Ban the given classification string for the provided duration in seconds
+      def ban!(classification, ban_duration)
+        key = ban_key(@name, classification)
+        @redis.setex(key, ban_duration, 1)
+      end
+
+      # return whether the given classification string is banned
+      def banned?(classification)
+        @redis.get(ban_key(@name, classification))
+      end
+    end
   end
 end

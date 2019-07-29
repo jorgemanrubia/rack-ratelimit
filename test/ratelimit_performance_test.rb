@@ -7,7 +7,7 @@ module RatelimitPerformanceTest
   BENCHMARK_WARMUP = 3
 
   def setup
-    @app = Proc.new { [200, {}, ["hello"]] }
+    @app = Proc.new { [200, {}, ['hello']] }
     @redis = Redis.new(:host => 'localhost', :port => 6379, :db => 0).tap(&:flushdb)
   end
 
@@ -44,6 +44,11 @@ module RatelimitPerformanceTest
     Rack::Ratelimit.new(app, options) { |env| 'classified' }
   end
 
+  # Given a hash containing 2 entries with the form <tt>{'Some label' => rake_request}</tt>, it will
+  # run a benchmark using each request, and verify that the second entry is slower than the first
+  # one by at most a factor passed in +threshold_factor+
+  #
+  #   assert_slower_by_at_most 1.10, 'Baseline' => baseline_request, 'Banning' => target_request
   def assert_slower_by_at_most(threshold_factor, request_configs)
     raise ArgumentError, 'Please provide 2 pairs label => request' if request_configs.length != 2
     baseline_label, baseline_request, target_label, target_request = request_configs.to_a.flatten
@@ -90,7 +95,7 @@ class MemcachedRatelimitPerformanceTest < Minitest::Test
   end
 
   def assert_banning_performance_compared_to_just_rate_limit(only_rate_limit_request, banned_request)
-    assert_slower_by_at_most 1.10, 'Rate limit' => only_rate_limit_request, 'Banning' => banned_request
+    assert_slower_by_at_most 1.3, 'Rate limit' => only_rate_limit_request, 'Banning' => banned_request
   end
 end
 

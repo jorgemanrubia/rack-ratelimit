@@ -24,7 +24,7 @@ module RatelimitTests
     assert_equal 200, status
     assert_match %r({"name":"one","period":10,"limit":1,"remaining":0,"until":".*","global":false}), headers['X-Ratelimit']
     assert_equal [], body
-    refute_match '/exceeded/', @out.string
+    refute_match /exceeded/, @out.string
   end
 
   def test_decrements_rate_limit_header_remaining_count
@@ -41,7 +41,7 @@ module RatelimitTests
     assert_match %r({"name":"one","period":10,"limit":1,"remaining":0,"until":".*","global":false}), info.first
     assert_match %r({"name":"two","period":10,"limit":1,"remaining":0,"until":".*","global":false}), info.last
     assert_equal [], body
-    refute_match '/exceeded/', @out.string
+    refute_match /exceeded/, @out.string
   end
 
   def test_responds_with_429_if_request_rate_exceeds_limit
@@ -246,9 +246,10 @@ class CustomStoreRatelimitTest < Minitest::Test
   end
 
   def test_raises_error_when_ban_duration_is_used_but_ban_methods_are_missing
-    assert_raises ArgumentError do
-      Rack::Ratelimit.new(nil, rate: [1,10], ban_duration: 15, store: store_without_methods(:ban!))
-      Rack::Ratelimit.new(nil, rate: [1,10], ban_duration: 15, store: store_without_methods(:banned?))
+    %i[ban! banned?].each do |method|
+      assert_raises ArgumentError do
+        Rack::Ratelimit.new(nil, rate: [1,10], ban_duration: 15, store: store_without_methods(method))
+      end
     end
   end
 
@@ -301,6 +302,10 @@ class LegacyCustomCounterRateLimitTest < CustomStoreRatelimitTest
 
   private
     def ratelimit_options
-      super.merge counter: (@store = CustomStoreRatelimitTest::Store.new)
+      super.tap do |options|
+        options.delete(:store)
+        @store = CustomStoreRatelimitTest::Store.new
+        options[:counter] = @store
+      end
     end
 end
