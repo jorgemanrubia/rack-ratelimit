@@ -194,7 +194,7 @@ module Rack
         end
 
         [@status,
-         {'X-Ratelimit' => ratelimit_json(remaining, retry_epoch, true),
+         {'X-Ratelimit' => ratelimit_json(remaining, retry_epoch, @ban_duration),
           'Retry-After' => retry_after.to_s},
          [@error_message % retry_after]]
       end
@@ -211,7 +211,7 @@ module Rack
       end
 
       def ratelimit_json(remaining, epoch, global = false)
-        %({"name":"#{@name}","period":#{@period},"limit":#{@max},"remaining":#{remaining < 0 ? 0 : remaining},"until":"#{format_epoch(epoch)}","global":"#{global}"})
+        %({"name":"#{@name}","period":#{@period},"limit":#{@max},"remaining":#{remaining < 0 ? 0 : remaining},"until":"#{format_epoch(epoch)}","global":#{!!global}})
       end
 
       def banned_json(epoch)
