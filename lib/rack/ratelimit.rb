@@ -257,7 +257,7 @@ module Rack
           if count = @cache.incr(key, 1)
             count.to_i
 
-            # If not, add the counter and set expiry.
+          # If not, add the counter and set expiry.
           elsif @cache.add(key, 1, @period, raw: true)
             1
 

@@ -1,8 +1,5 @@
 require_relative 'test_helper'
-require_relative 'dummy_app'
-require 'rack/test'
-
-ENV['APP_ENV'] = 'test'
+require_relative 'system_test_helper'
 
 module RatelimitSystemTests
   include Rack::Test::Methods
@@ -41,6 +38,7 @@ module RatelimitSystemTests
     assert_rate_limited '/open'
 
     sleep 2
+
     assert_not_rate_limited '/protected'
     assert_not_rate_limited '/open'
   end

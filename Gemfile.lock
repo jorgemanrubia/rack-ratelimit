@@ -6,6 +6,7 @@ PATH
 GEM
   remote: https://rubygems.org/
   specs:
+    benchmark-ips (2.7.2)
     dalli (2.7.6)
     minitest (5.10.1)
     mustermann (1.0.3)
@@ -27,6 +28,7 @@ PLATFORMS
   ruby
 
 DEPENDENCIES
+  benchmark-ips
   dalli
   minitest
   rack-ratelimit!
@@ -36,4 +38,4 @@ DEPENDENCIES
   sinatra
 
 BUNDLED WITH
-   1.17.1
+   1.17.2
