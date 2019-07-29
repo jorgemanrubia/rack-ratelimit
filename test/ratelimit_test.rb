@@ -57,6 +57,7 @@ module RatelimitTests
     assert_match %r({"name":"one","period":10,"limit":1,"remaining":0,"until":".*"}), headers['X-Ratelimit']
     assert_equal "one rate limit exceeded. Please wait #{retry_after} seconds then retry your request.", body.first
     assert_match %r{one: classification exceeded 1 request limit for}, @out.string
+    refute_match %r{(banned)}, @out.string
   end
 
   def test_responds_with_429_indicating_ban_duration_the_first_time_a_request_is_banned
@@ -72,6 +73,7 @@ module RatelimitTests
     assert_match %r({"name":"banned","period":10,"limit":1,"remaining":0,"until":".*","global":"true"}), headers['X-Ratelimit']
     assert_equal "banned rate limit exceeded. Please wait #{retry_after} seconds then retry your request.", body.first
     assert_match %r{banned: classification exceeded 1 request limit for}, @out.string
+    assert_match %r{(banned)}, @out.string
   end
 
   def test_responds_with_429_to_every_request_from_banned_clients

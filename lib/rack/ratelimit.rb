@@ -173,12 +173,13 @@ module Rack
       end
 
       def handle_limit_exceeded_request(classification, now, epoch, remaining)
+        @store.ban!(classification, @ban_duration) if @ban_duration
+
         # Only log the first hit that exceeds the limit.
         if @logger && remaining == -1
-          @logger.info '%s: %s exceeded %d request limit for %s' % [@name, classification, @max, format_epoch(epoch)]
+          @logger.info '%s: %s exceeded %d request limit for %s %s' %
+                           [@name, classification, @max, format_epoch(epoch),  (' (banned)' if @ban_duration)]
         end
-
-        @store.ban!(classification, @ban_duration) if @ban_duration
 
         build_limit_exceeded_response(now, epoch, remaining)
       end
