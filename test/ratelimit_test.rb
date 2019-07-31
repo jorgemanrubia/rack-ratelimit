@@ -1,21 +1,17 @@
-require 'rubygems'
-require 'bundler/setup'
-require 'minitest/autorun'
-
-require 'rack/ratelimit'
-require 'stringio'
-require 'json'
-
-require 'dalli'
-require 'redis'
+require_relative './test_helper'
 
 module RatelimitTests
+  WINDOW_DURATION = 10
+
+  BAN_DURATION = 15
+
   def setup
     @app = ->(env) { [200, {}, []] }
     @logger = Logger.new(@out = StringIO.new)
 
-    @limited = build_ratelimiter(@app, name: :one, rate: [1, 10])
-    @two_limits = build_ratelimiter(@limited, name: :two, rate: [1, 10])
+    @limited = build_ratelimiter(@app, name: :one, rate: [1, WINDOW_DURATION])
+    @two_limits = build_ratelimiter(@limited, name: :two, rate: [1, WINDOW_DURATION])
+    @banneable = build_ratelimiter(@app, name: :banned, rate: [1, WINDOW_DURATION], ban_duration: BAN_DURATION)
   end
 
   def test_name_defaults_to_HTTP
@@ -26,13 +22,13 @@ module RatelimitTests
   def test_sets_informative_header_when_rate_limit_isnt_exceeded
     status, headers, body = @limited.call({})
     assert_equal 200, status
-    assert_match %r({"name":"one","period":10,"limit":1,"remaining":0,"until":".*"}), headers['X-Ratelimit']
+    assert_match %r({"name":"one","period":10,"limit":1,"remaining":0,"until":".*","global":false}), headers['X-Ratelimit']
     assert_equal [], body
-    assert_equal '', @out.string
+    refute_match /exceeded/, @out.string
   end
 
   def test_decrements_rate_limit_header_remaining_count
-    app = build_ratelimiter(@app, rate: [3, 10])
+    app = build_ratelimiter(@app, rate: [3, WINDOW_DURATION])
     remainings = 5.times.map { JSON.parse(app.call({})[1]['X-Ratelimit'])['remaining'] }
     assert_equal [2,1,0,0,0], remainings
   end
@@ -42,15 +38,15 @@ module RatelimitTests
     assert_equal 200, status
     info = headers['X-Ratelimit'].split("\n")
     assert_equal 2, info.size
-    assert_match %r({"name":"one","period":10,"limit":1,"remaining":0,"until":".*"}), info.first
-    assert_match %r({"name":"two","period":10,"limit":1,"remaining":0,"until":".*"}), info.last
+    assert_match %r({"name":"one","period":10,"limit":1,"remaining":0,"until":".*","global":false}), info.first
+    assert_match %r({"name":"two","period":10,"limit":1,"remaining":0,"until":".*","global":false}), info.last
     assert_equal [], body
-    assert_equal '', @out.string
+    refute_match /exceeded/, @out.string
   end
 
   def test_responds_with_429_if_request_rate_exceeds_limit
     timestamp = Time.now.to_f
-    epoch = 10 * (timestamp / 10).ceil
+    epoch = WINDOW_DURATION * (timestamp / WINDOW_DURATION).ceil
     retry_after = (epoch - timestamp).ceil
 
     assert_equal 200, @limited.call('limit-by' => 'key', 'ratelimit.timestamp' => timestamp).first
@@ -58,9 +54,40 @@ module RatelimitTests
     assert_equal 429, status
     assert_equal retry_after.to_s, headers['Retry-After']
     assert_match '0', headers['X-Ratelimit']
-    assert_match %r({"name":"one","period":10,"limit":1,"remaining":0,"until":".*"}), headers['X-Ratelimit']
+    assert_match %r({"name":"one","period":10,"limit":1,"remaining":0,"until":".*","global":false}), headers['X-Ratelimit']
     assert_equal "one rate limit exceeded. Please wait #{retry_after} seconds then retry your request.", body.first
     assert_match %r{one: classification exceeded 1 request limit for}, @out.string
+    refute_match %r{(banned)}, @out.string
+  end
+
+  def test_responds_with_429_indicating_ban_duration_the_first_time_a_request_is_banned
+    timestamp = Time.now.to_f
+    retry_after = BAN_DURATION
+
+    assert_equal 200, @banneable.call('limit-by' => 'key', 'ratelimit.timestamp' => timestamp).first
+    status, headers, body = @banneable.call('limit-by' => 'key', 'ratelimit.timestamp' => timestamp)
+    assert_equal 429, status
+    assert_equal BAN_DURATION, ban_ttl('banned', 'classification')
+    assert_equal retry_after.to_s, headers['Retry-After']
+    assert_match '0', headers['X-Ratelimit']
+    assert_match %r({"name":"banned","period":10,"limit":1,"remaining":0,"until":".*","global":true}), headers['X-Ratelimit']
+    assert_equal "banned rate limit exceeded. Please wait #{retry_after} seconds then retry your request.", body.first
+    assert_match %r{banned: classification exceeded 1 request limit for}, @out.string
+    assert_match %r{(banned)}, @out.string
+  end
+
+  def test_responds_with_429_to_every_request_from_banned_clients
+    @banneable.condition { |env| env['target'] } # to test that banning works when conditions don't match too
+
+    timestamp = Time.now.to_f
+    retry_after = BAN_DURATION
+
+    assert_equal 200, @banneable.call('target' => true, 'ratelimit.timestamp' => timestamp).first
+    @banneable.call('target' => true, 'ratelimit.timestamp' => timestamp)
+    status, headers, _ = @banneable.call('ratelimit.timestamp' => timestamp)
+    assert_match %r({"name":"banned","period":10,"limit":1,"remaining":0,"until":".*","global":true}), headers['X-Ratelimit']
+    assert_equal 429, status
+    assert_equal retry_after.to_s, headers['Retry-After']
   end
 
   def test_optional_response_status
@@ -134,7 +161,7 @@ module RatelimitTests
     end
 
     def ratelimit_options
-      { rate: [1,10], logger: @logger }
+      {rate: [1, WINDOW_DURATION], logger: @logger }
     end
 end
 
@@ -146,11 +173,25 @@ class RequiredBackendTest < Minitest::Test
   end
 end
 
+DalliClientThatCanCollectTtls = Class.new(Dalli::Client) do
+  attr_reader :ttls_by_key
+
+  def add(key, value, ttl = nil, options = nil)
+    super.tap do
+      @ttls_by_key ||= {}
+      @ttls_by_key[key] = ttl
+    end
+  end
+end
+
 class MemcachedRatelimitTest < Minitest::Test
   include RatelimitTests
+  include Rack::Ratelimit::StoreKeys
+
+  MEMCACHED_PORT = 11211
 
   def setup
-    @cache = Dalli::Client.new('localhost:11211').tap(&:flush)
+    @cache = DalliClientThatCanCollectTtls.new("localhost:#{MEMCACHED_PORT}").tap(&:flush)
     super
   end
 
@@ -163,10 +204,16 @@ class MemcachedRatelimitTest < Minitest::Test
     def ratelimit_options
       super.merge cache: @cache
     end
+
+    # Used to check expiration dates for testing purposes
+    def ban_ttl(name, classification)
+      @cache.ttls_by_key[ban_key(name, classification)]
+    end
 end
 
 class RedisRatelimitTest < Minitest::Test
   include RatelimitTests
+  include Rack::Ratelimit::StoreKeys
 
   def setup
     @redis = Redis.new(:host => 'localhost', :port => 6379, :db => 0).tap(&:flushdb)
@@ -182,27 +229,83 @@ class RedisRatelimitTest < Minitest::Test
     def ratelimit_options
       super.merge redis: @redis
     end
+
+    # Used to check expiration dates for testing purposes
+    def ban_ttl(name, classification)
+      @redis.ttl(ban_key(name, classification))
+    end
 end
 
-class CustomCounterRatelimitTest < Minitest::Test
+class CustomStoreRatelimitTest < Minitest::Test
   include RatelimitTests
+
+  def test_raises_error_when_missing_increment_method
+    assert_raises ArgumentError do
+      Rack::Ratelimit.new(nil, rate: [1,10], store: store_without_methods(:increment))
+    end
+  end
+
+  def test_raises_error_when_ban_duration_is_used_but_ban_methods_are_missing
+    %i[ban! banned?].each do |method|
+      assert_raises ArgumentError do
+        Rack::Ratelimit.new(nil, rate: [1,10], ban_duration: 15, store: store_without_methods(method))
+      end
+    end
+  end
 
   private
     def ratelimit_options
-      super.merge counter: Counter.new
+      super.merge store: (@store = Store.new)
     end
 
-  class Counter
-    def initialize
-      @counters = Hash.new do |classifications, name|
-        classifications[name] = Hash.new do |timeslices, timestamp|
-          timeslices[timestamp] = 0
+    # Used to check expiration dates for testing purposes
+    def ban_ttl(name, classification)
+      @store.banned_clients[classification]
+    end
+
+    def store_without_methods(*methods_to_remove)
+      Store.new.tap do |valid_store|
+        methods_to_remove.each do |method|
+          valid_store.instance_eval("undef :#{method}")
         end
       end
     end
 
-    def increment(classification, timestamp)
-      @counters[classification][timestamp] += 1
+    class Store
+      attr :banned_clients
+
+      def initialize
+        @counters = Hash.new do |classifications, name|
+          classifications[name] = Hash.new do |timeslices, timestamp|
+            timeslices[timestamp] = 0
+          end
+        end
+        @banned_clients = {}
+      end
+
+      def increment(classification, timestamp)
+        @counters[classification][timestamp] += 1
+      end
+
+      def ban!(classification, ban_duration)
+        @banned_clients[classification] = ban_duration
+      end
+
+      def banned?(classification)
+        @banned_clients[classification]
+      end
     end
-  end
+end
+
+class LegacyCustomCounterRateLimitTest < CustomStoreRatelimitTest
+  include RatelimitTests
+
+  private
+    def ratelimit_options
+      super.tap do |options|
+        options.delete(:store)
+        @store = CustomStoreRatelimitTest::Store.new
+        options[:counter] = @store
+      end
+    end
 end
